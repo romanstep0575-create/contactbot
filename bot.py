@@ -1,409 +1,278 @@
-import asyncio
-import logging
 import os
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import logging
+import telebot
+from telebot import types
+import sqlite3
+import requests
 from dotenv import load_dotenv
-import aiohttp
-from database import init_db, get_user, create_user, update_credits, add_search_history
 
-# Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Инициализация бота
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-DADATA_TOKEN = os.getenv('DADATA_API_KEY')
-DADATA_SECRET = os.getenv('DADATA_SECRET_KEY')
+DADATA_API_KEY = os.getenv('DADATA_API_KEY')
+DADATA_SECRET_KEY = os.getenv('DADATA_SECRET_KEY')
 
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден в переменных окружения!")
+bot = telebot.TeleBot(BOT_TOKEN)
+DB_PATH = 'contacts.db'
 
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            credits INTEGER DEFAULT 0,
+            total_searches INTEGER DEFAULT 0,
+            successful_searches INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS search_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            query TEXT,
+            company TEXT,
+            email TEXT,
+            found BOOLEAN,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized")
 
-# Состояния
-class SearchStates(StatesGroup):
-    waiting_for_query = State()
-
-# Цены
-PRICES = {
-    '50': {'credits': 50, 'price': 499, 'label': '50 кредитов - 499₽'},
-    '250': {'credits': 250, 'price': 1990, 'label': '250 кредитов - 1990₽'},
-    '750': {'credits': 750, 'price': 4990, 'label': '750 кредитов - 4990₽'},
-}
-
-# ============================================
-# ФУНКЦИЯ ПОИСКА В DADATA
-# ============================================
-
-async def search_company(query: str):
-    """Поиск компании через DaData API"""
-    if not DADATA_TOKEN:
-        logger.error("DaData токен не настроен!")
-        return None
-    
-    try:
-        url = "https://suggestions.api.dadata.ru/suggestions/api/4_1/rs/suggest/party"
-        headers = {
-            "Authorization": f"Token {DADATA_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        data_req = {"query": query, "count": 1}
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=data_req) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    suggestions = result.get('suggestions', [])
-                    
-                    if suggestions:
-                        company = suggestions[0]
-                        data = company.get('data', {})
-                        management = data.get('management', {})
-                        state = data.get('state', {})
-                        address_data = data.get('address', {})
-                        name_data = data.get('name', {})
-                        
-                        emails = data.get('emails')
-                        phones = data.get('phones')
-                        
-                        email = None
-                        if emails and len(emails) > 0:
-                            email = emails[0].get('value') if isinstance(emails[0], dict) else emails[0]
-                        
-                        phone = None
-                        if phones and len(phones) > 0:
-                            phone = phones[0].get('value') if isinstance(phones[0], dict) else phones[0]
-                        
-                        return {
-                            'inn': data.get('inn'),
-                            'ogrn': data.get('ogrn'),
-                            'kpp': data.get('kpp'),
-                            'full_name': name_data.get('full_with_opf'),
-                            'short_name': name_data.get('short_with_opf'),
-                            'director_name': management.get('name'),
-                            'director_post': management.get('post') or 'Генеральный директор',
-                            'address': address_data.get('value'),
-                            'status': state.get('status'),
-                            'registration_date': state.get('registration_date'),
-                            'email': email,
-                            'phone': phone,
-                        }
-                else:
-                    logger.error(f"DaData API error: {response.status}")
-    except Exception as e:
-        logger.error(f"DaData Error: {e}")
-    
+def get_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {'user_id': row[0], 'username': row[1], 'credits': row[2], 'total_searches': row[3], 'successful_searches': row[4]}
     return None
 
-# ============================================
-# ОБРАБОТЧИКИ КОМАНД
-# ============================================
+def create_user(user_id, username, credits=10):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO users (user_id, username, credits) VALUES (?, ?, ?)', (user_id, username, credits))
+    conn.commit()
+    conn.close()
 
-@dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    """Команда /start"""
-    user_id = message.from_user.id
-    user = await get_user(user_id)
-    
-    if not user:
-        await create_user(user_id, message.from_user.username or "Anonymous", 10)
-        credits = 10
-        is_new = True
+def update_credits(user_id, amount):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET credits = credits + ? WHERE user_id = ?', (amount, user_id))
+    conn.commit()
+    conn.close()
+
+def add_search_history(user_id, query, company, email, found):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO search_history (user_id, query, company, email, found) VALUES (?, ?, ?, ?, ?)', (user_id, query, company, email, found))
+    if found:
+        cursor.execute('UPDATE users SET total_searches = total_searches + 1, successful_searches = successful_searches + 1 WHERE user_id = ?', (user_id,))
     else:
-        credits = user['credits']
-        is_new = False
+        cursor.execute('UPDATE users SET total_searches = total_searches + 1 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def search_company_dadata(query):
+    url = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/party"
+    headers = {"Authorization": f"Token {DADATA_API_KEY}", "Content-Type": "application/json"}
+    data = {"query": query, "count": 5}
+    try:
+        response = requests.post(url, json=data, headers=headers)
+        if response.status_code == 200:
+            return response.json().get('suggestions', [])
+        return []
+    except Exception as e:
+        logger.error(f"DaData error: {e}")
+        return []
+
+def search_phone_dadata(phone):
+    """Поиск информации о телефоне через DaData Clean API"""
+    url = "https://cleaner.dadata.ru/api/v1/clean/phone"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Token {DADATA_API_KEY}",
+        "X-Secret": DADATA_SECRET_KEY
+    }
+    data = [phone]
     
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton("🔍 Найти компанию", callback_data="search"),
-        InlineKeyboardButton("💳 Купить кредиты", callback_data="buy"),
-        InlineKeyboardButton("📊 Мой баланс", callback_data="balance"),
-        InlineKeyboardButton("ℹ️ Как работает", callback_data="help")
-    )
+    try:
+        response = requests.post(url, json=data, headers=headers)
+        if response.status_code == 200:
+            result = response.json()
+            if result and len(result) > 0:
+                return result[0]
+        return None
+    except Exception as e:
+        logger.error(f"DaData phone search error: {e}")
+        return None
+
+def format_company_info(suggestion):
+    data = suggestion.get('data', {})
+    name = data.get('name', {}).get('full_with_opf', 'Не указано')
+    inn = data.get('inn', 'Не указано')
+    kpp = data.get('kpp', 'Не указано')
+    ogrn = data.get('ogrn', 'Не указано')
+    address = data.get('address', {}).get('value', 'Не указано')
+    management = data.get('management', {})
+    ceo = management.get('name', 'Не указано') if management else 'Не указано'
+    emails = data.get('emails', [])
+    phones = data.get('phones', [])
+    email_str = ', '.join([e.get('value', '') for e in emails]) if emails else 'Не найдено'
+    phone_str = ', '.join([p.get('value', '') for p in phones]) if phones else 'Не найдено'
+    result = f"🏢 <b>{name}</b>\n\n📋 <b>Реквизиты:</b>\n• ИНН: {inn}\n• КПП: {kpp}\n• ОГРН: {ogrn}\n\n📍 <b>Адрес:</b>\n{address}\n\n👤 <b>Руководитель:</b>\n{ceo}\n\n📧 <b>Email:</b> {email_str}\n📞 <b>Телефон:</b> {phone_str}"
+    return result, bool(emails)
+
+def format_phone_info(phone_data):
+    """Форматирует информацию о телефоне"""
+    if not phone_data:
+        return "❌ Информация не найдена", False
     
-    welcome_text = f"""
-🇷🇺 <b>ContactFinder - Поиск компаний РФ</b>
-
-Найду полные данные любой российской компании:
-
-📋 <b>ЕГРЮЛ данные:</b>
-• ИНН, ОГРН, КПП
-• ФИО директора
-• Юридический адрес
-• Дата регистрации
-
-📞 <b>Контакты:</b>
-• Email компании
-• Телефон компании
-
-{'🎁 <b>Вам начислено 10 бесплатных кредитов!</b>' if is_new else f'💰 <b>Ваш баланс:</b> {credits} кредитов'}
-
-<i>1 поиск = 1 кредит</i>
-"""
+    phone = phone_data.get('phone', 'Не указан')
+    country = phone_data.get('country', 'Не указана')
+    city = phone_data.get('city', 'Не указан')
+    provider = phone_data.get('provider', 'Не указан')
+    phone_type = phone_data.get('type', 'Не указан')
+    region = phone_data.get('region', 'Не указан')
+    timezone = phone_data.get('timezone', 'Не указан')
     
-    await message.answer(welcome_text, reply_markup=keyboard, parse_mode='HTML')
-
-
-@dp.callback_query_handler(lambda c: c.data == "help")
-async def show_help(callback: types.CallbackQuery):
-    """Помощь"""
-    help_text = """
-<b>📖 Как работает ContactFinder?</b>
-
-1️⃣ Вы вводите название компании или ИНН
-2️⃣ Мы ищем в официальной базе ЕГРЮЛ
-3️⃣ Возвращаем полные данные
-
-<b>Примеры запросов:</b>
-• Яндекс
-• ООО Рога и Копыта
-• Сбербанк
-• 7707083893 (ИНН)
-
-<b>Что вы получите:</b>
-✅ Полные реквизиты компании
-✅ ФИО директора
-✅ Email и телефон (если есть)
-✅ Юридический адрес
-
-<b>Источник:</b> DaData (ЕГРЮЛ)
-"""
-    await callback.message.answer(help_text, parse_mode='HTML')
-    await callback.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data == "search")
-async def start_search(callback: types.CallbackQuery):
-    """Начало поиска"""
-    user_id = callback.from_user.id
-    user = await get_user(user_id)
+    result = f"📞 <b>Телефон:</b> {phone}\n\n"
+    result += f"🌍 <b>Страна:</b> {country}\n"
+    result += f"🏙 <b>Регион:</b> {region}\n"
+    result += f"📍 <b>Город:</b> {city}\n"
+    result += f"📡 <b>Оператор:</b> {provider}\n"
+    result += f"📱 <b>Тип:</b> {phone_type}\n"
+    result += f"🕐 <b>Часовой пояс:</b> {timezone}\n"
     
-    if not user or user['credits'] < 1:
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(InlineKeyboardButton("💳 Купить кредиты", callback_data="buy"))
-        await callback.message.answer(
-            "❌ <b>Недостаточно кредитов!</b>\n\nПополните баланс.",
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-        await callback.answer()
+    return result, True
+
+def get_main_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add(types.KeyboardButton("🔍 Поиск контактов"))
+    keyboard.add(types.KeyboardButton("📞 Поиск по телефону"))
+    keyboard.add(types.KeyboardButton("💰 Баланс"), types.KeyboardButton("📊 Статистика"))
+    keyboard.add(types.KeyboardButton("ℹ️ Помощь"))
+    return keyboard
+
+user_states = {}
+
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
+    user = get_user(user_id)
+    if not user:
+        create_user(user_id, username, credits=10)
+        text = f"👋 Привет, {username}!\n\nДобро пожаловать в бота для поиска контактов компаний!\n\n🎁 Вам начислено 10 бесплатных кредитов для тестирования.\n\nИспользуйте кнопки меню для навигации."
+    else:
+        text = f"С возвращением, {username}! 👋"
+    bot.send_message(message.chat.id, text, reply_markup=get_main_keyboard())
+
+@bot.message_handler(func=lambda message: message.text == "💰 Баланс")
+def show_balance(message):
+    user = get_user(message.from_user.id)
+    if user:
+        text = f"💰 <b>Ваш баланс:</b> {user['credits']} кредитов"
+    else:
+        text = "Ошибка: пользователь не найден. Используйте /start"
+    bot.send_message(message.chat.id, text, parse_mode='HTML')
+
+@bot.message_handler(func=lambda message: message.text == "📊 Статистика")
+def show_stats(message):
+    user = get_user(message.from_user.id)
+    if user:
+        text = f"📊 <b>Ваша статистика:</b>\n\n• Всего поисков: {user['total_searches']}\n• Успешных: {user['successful_searches']}\n• Кредитов осталось: {user['credits']}"
+    else:
+        text = "Ошибка: пользователь не найден. Используйте /start"
+    bot.send_message(message.chat.id, text, parse_mode='HTML')
+
+@bot.message_handler(func=lambda message: message.text == "ℹ️ Помощь")
+@bot.message_handler(commands=['help'])
+def show_help(message):
+    text = "ℹ️ <b>Помощь по использованию бота</b>\n\n<b>Как искать контакты:</b>\n1. Нажмите 'Поиск контактов'\n2. Введите название компании или ИНН\n3. Получите результаты с контактами\n\n<b>Стоимость:</b>\n1 поиск = 1 кредит"
+    bot.send_message(message.chat.id, text, parse_mode='HTML')
+
+@bot.message_handler(func=lambda message: message.text == "🔍 Поиск контактов")
+def start_search(message):
+    user = get_user(message.from_user.id)
+    if not user:
+        bot.send_message(message.chat.id, "Используйте /start для начала работы")
+        return
+    if user['credits'] <= 0:
+        bot.send_message(message.chat.id, "❌ У вас закончились кредиты!")
+        return
+    user_states[message.from_user.id] = 'waiting_for_query'
+    bot.send_message(message.chat.id, "🔍 Введите название компании или ИНН для поиска:", reply_markup=types.ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda message: message.text == "📞 Поиск по телефону")
+def start_phone_search(message):
+    user = get_user(message.from_user.id)
+    if not user:
+        bot.send_message(message.chat.id, "Используйте /start для начала работы")
+        return
+    if user['credits'] <= 0:
+        bot.send_message(message.chat.id, "❌ У вас закончились кредиты!")
+        return
+    user_states[message.from_user.id] = 'waiting_for_phone'
+    bot.send_message(message.chat.id, "📞 Введите номер телефона для поиска:\n\nПример: +79161234567 или 8 916 123-45-67", reply_markup=types.ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id) == 'waiting_for_query')
+def process_search(message):
+    query = message.text.strip()
+    bot.send_message(message.chat.id, "⏳ Ищу информацию...")
+    suggestions = search_company_dadata(query)
+    if not suggestions:
+        add_search_history(message.from_user.id, query, "Не найдено", "", False)
+        bot.send_message(message.chat.id, "❌ По вашему запросу ничего не найдено.", reply_markup=get_main_keyboard())
+        user_states.pop(message.from_user.id, None)
+        return
+    update_credits(message.from_user.id, -1)
+    for i, suggestion in enumerate(suggestions[:3], 1):
+        company_info, has_email = format_company_info(suggestion)
+        bot.send_message(message.chat.id, f"<b>Результат {i}:</b>\n{company_info}", parse_mode='HTML')
+        if i == 1:
+            company_name = suggestion.get('data', {}).get('name', {}).get('short_with_opf', query)
+            emails = suggestion.get('data', {}).get('emails', [])
+            email = emails[0].get('value', '') if emails else ''
+            add_search_history(message.from_user.id, query, company_name, email, has_email)
+    user = get_user(message.from_user.id)
+    bot.send_message(message.chat.id, f"✅ Поиск завершён!\n💰 Осталось кредитов: {user['credits']}", reply_markup=get_main_keyboard())
+    user_states.pop(message.from_user.id, None)
+
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id) == 'waiting_for_phone')
+def process_phone_search(message):
+    phone = message.text.strip()
+    bot.send_message(message.chat.id, "⏳ Ищу информацию о телефоне...")
+    
+    phone_data = search_phone_dadata(phone)
+    
+    if not phone_data or phone_data.get('qc') != 0:
+        add_search_history(message.from_user.id, phone, "Телефон", "", False)
+        bot.send_message(message.chat.id, "❌ Не удалось найти информацию по этому номеру.", reply_markup=get_main_keyboard())
+        user_states.pop(message.from_user.id, None)
         return
     
-    await callback.message.answer(
-        "🏢 <b>Введите название компании или ИНН:</b>\n\n"
-        "<b>Примеры:</b>\n"
-        "• Яндекс\n"
-        "• ООО Технологии\n"
-        "• 7707083893\n\n"
-        "Я найду все данные из ЕГРЮЛ 🎯",
-        parse_mode='HTML'
-    )
-    await SearchStates.waiting_for_query.set()
-    await callback.answer()
-
-
-@dp.message_handler(state=SearchStates.waiting_for_query)
-async def process_search(message: types.Message, state: FSMContext):
-    """Обработка поиска"""
-    query = message.text.strip()
-    user_id = message.from_user.id
+    update_credits(message.from_user.id, -1)
     
-    # Списываем кредит
-    await update_credits(user_id, -1)
+    phone_info, found = format_phone_info(phone_data)
+    bot.send_message(message.chat.id, phone_info, parse_mode='HTML')
     
-    # Показываем прогресс
-    progress_msg = await message.answer(
-        "🔍 <b>Ищу данные...</b>\n\n"
-        "⏳ Проверяю базу ЕГРЮЛ\n\n"
-        "<i>Подождите 5-10 секунд</i>",
-        parse_mode='HTML'
-    )
+    add_search_history(message.from_user.id, phone, "Телефон", "", found)
     
-    # ПОИСК
-    company = await search_company(query)
-    
-    if company:
-        # НАЙДЕНО!
-        response = f"""
-✅ <b>ДАННЫЕ НАЙДЕНЫ</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📋 <b>КОМПАНИЯ</b>
-━━━━━━━━━━━━━━━━━━━━
-
-<b>Название:</b>
-{company.get('full_name', 'Н/Д')}
-
-<b>ИНН:</b> <code>{company.get('inn', 'Н/Д')}</code>
-<b>ОГРН:</b> <code>{company.get('ogrn', 'Н/Д')}</code>
-<b>КПП:</b> <code>{company.get('kpp', 'Н/Д')}</code>
-
-<b>Статус:</b> {company.get('status', 'Н/Д')}
-<b>Дата регистрации:</b> {company.get('registration_date', 'Н/Д')}
-
-<b>Адрес:</b>
-{company.get('address', 'Н/Д')[:200]}...
-
-━━━━━━━━━━━━━━━━━━━━
-👤 <b>РУКОВОДИТЕЛЬ</b>
-━━━━━━━━━━━━━━━━━━━━
-
-<b>ФИО:</b> {company.get('director_name', 'Н/Д')}
-<b>Должность:</b> {company.get('director_post', 'Н/Д')}
-"""
-        
-        # Добавляем контакты если есть
-        if company.get('email') or company.get('phone'):
-            response += "\n━━━━━━━━━━━━━━━━━━━━\n"
-            response += "📞 <b>КОНТАКТЫ</b>\n"
-            response += "━━━━━━━━━━━━━━━━━━━━\n\n"
-            
-            if company.get('email'):
-                response += f"📧 Email: <code>{company['email']}</code>\n"
-            if company.get('phone'):
-                response += f"📱 Телефон: <code>{company['phone']}</code>\n"
-        
-        response += "\n<i>📊 Источник: DaData (ЕГРЮЛ)</i>"
-        
-        await add_search_history(
-            user_id,
-            query,
-            company.get('short_name', ''),
-            company.get('email'),
-            True
-        )
-        
-        await progress_msg.edit_text(response, parse_mode='HTML')
-        
-    else:
-        # НЕ НАЙДЕНО
-        await add_search_history(user_id, query, '', None, False)
-        
-        await progress_msg.edit_text(
-            f"❌ <b>Компания не найдена</b>\n\n"
-            f"Запрос: <i>{query}</i>\n\n"
-            f"💡 <b>Попробуйте:</b>\n"
-            f"• Проверьте правильность написания\n"
-            f"• Используйте полное название (ООО, АО)\n"
-            f"• Введите ИНН компании\n\n"
-            f"🔄 <b>Кредит НЕ списан</b>",
-            parse_mode='HTML'
-        )
-        
-        # Возвращаем кредит
-        await update_credits(user_id, 1)
-    
-    # Сбрасываем состояние
-    await state.finish()
-    
-    # Показываем баланс
-    user = await get_user(user_id)
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton("🔍 Еще поиск", callback_data="search"),
-        InlineKeyboardButton("💳 Купить кредиты", callback_data="buy")
-    )
-    
-    await message.answer(
-        f"💰 <b>Осталось кредитов:</b> {user['credits']}",
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
-
-
-@dp.callback_query_handler(lambda c: c.data == "balance")
-async def show_balance(callback: types.CallbackQuery):
-    """Баланс"""
-    user_id = callback.from_user.id
-    user = await get_user(user_id)
-    
-    success_rate = 0
-    if user.get('total_searches', 0) > 0:
-        success_rate = round((user.get('successful_searches', 0) / user['total_searches']) * 100)
-    
-    await callback.message.answer(
-        f"📊 <b>ВАША СТАТИСТИКА</b>\n\n"
-        f"💰 <b>Баланс:</b> {user['credits']} кредитов\n\n"
-        f"📈 <b>Активность:</b>\n"
-        f"├ Всего поисков: {user.get('total_searches', 0)}\n"
-        f"├ Успешных: {user.get('successful_searches', 0)}\n"
-        f"└ Процент успеха: {success_rate}%",
-        parse_mode='HTML'
-    )
-    await callback.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data == "buy")
-async def show_prices(callback: types.CallbackQuery):
-    """Цены"""
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton(PRICES['50']['label'], callback_data="buy_50"),
-        InlineKeyboardButton(PRICES['250']['label'], callback_data="buy_250"),
-        InlineKeyboardButton(PRICES['750']['label'], callback_data="buy_750")
-    )
-    
-    await callback.message.answer(
-        "💳 <b>ПАКЕТЫ КРЕДИТОВ</b>\n\n"
-        "1 кредит = 1 поиск компании\n\n"
-        "💎 При покупке от 250 кредитов - скидка 20%!\n\n"
-        "Выберите пакет:",
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
-    await callback.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("buy_"))
-async def process_payment(callback: types.CallbackQuery):
-    """Покупка"""
-    package = callback.data.replace("buy_", "")
-    admin_id = os.getenv('ADMIN_ID', 'yourusername')
-    
-    await callback.message.answer(
-        f"💳 <b>ОПЛАТА</b>\n\n"
-        f"Пакет: <b>{PRICES[package]['label']}</b>\n\n"
-        f"<b>Для покупки напишите:</b>\n"
-        f"@{admin_id}\n\n"
-        f"<b>Укажите:</b>\n"
-        f"• Выбранный пакет\n"
-        f"• Ваш ID: <code>{callback.from_user.id}</code>\n\n"
-        f"Кредиты будут начислены в течение 5 минут! ⚡",
-        parse_mode='HTML'
-    )
-    await callback.answer()
-
-
-# ============================================
-# ЗАПУСК БОТА
-# ============================================
-
-async def on_startup(dp):
-    """При запуске"""
-    await init_db()
-    logger.info("=" * 50)
-    logger.info("🚀 Бот успешно запущен!")
-    logger.info("=" * 50)
-
-
-async def on_shutdown(dp):
-    """При остановке"""
-    logger.info("👋 Бот остановлен")
-    await bot.close()
-
+    user = get_user(message.from_user.id)
+    bot.send_message(message.chat.id, f"✅ Поиск завершён!\n💰 Осталось кредитов: {user['credits']}", reply_markup=get_main_keyboard())
+    user_states.pop(message.from_user.id, None)
 
 if __name__ == '__main__':
-    from aiogram import executor
-    executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
+    init_db()
+    logger.info("Бот запущен!")
+    bot.polling(none_stop=True)
